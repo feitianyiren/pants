@@ -28,7 +28,12 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.logging.Logger;
+
 import org.apache.commons.io.output.TeeOutputStream;
+import org.junit.internal.builders.AllDefaultPossibilitiesBuilder;
+import org.junit.internal.builders.AnnotatedBuilder;
+import org.junit.internal.builders.JUnit4Builder;
 import org.junit.runner.Computer;
 import org.junit.runner.Description;
 import org.junit.runner.JUnitCore;
@@ -40,6 +45,7 @@ import org.junit.runner.notification.Failure;
 import org.junit.runner.notification.RunListener;
 import org.junit.runner.notification.RunNotifier;
 import org.junit.runners.model.InitializationError;
+import org.junit.runners.model.RunnerBuilder;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -49,8 +55,14 @@ import org.pantsbuild.args4j.InvalidCmdLineArgumentException;
 import org.pantsbuild.junit.annotations.TestParallel;
 import org.pantsbuild.junit.annotations.TestSerial;
 import org.pantsbuild.tools.junit.impl.experimental.ConcurrentComputer;
+import org.pantsbuild.tools.junit.impl.security.JunitSecViolationReportingManager;
+import org.pantsbuild.tools.junit.impl.security.JunitSecurityManagerConfig;
+import org.pantsbuild.tools.junit.impl.security.JunitSecurityManagerConfig.ThreadHandling;
+import org.pantsbuild.tools.junit.impl.security.SecurityManagedRunner;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+
+import static org.pantsbuild.tools.junit.impl.security.JunitSecurityManagerConfig.*;
 
 /**
  * An alternative to {@link JUnitCore} with stream capture and junit-report xml output capabilities.
@@ -60,6 +72,8 @@ public class ConsoleRunnerImpl {
   private static boolean callSystemExitOnFinish = true;
   /** Intended to be used in unit testing this class */
   private static RunListener testListener = null;
+  private JunitSecViolationReportingManager securityManager;
+  private static Logger logger = Logger.getLogger("pants-junit");
 
   /**
    * A stream that allows its underlying output to be swapped.
@@ -388,7 +402,9 @@ public class ConsoleRunnerImpl {
       int numRetries,
       boolean useExperimentalRunner,
       PrintStream out,
-      PrintStream err) {
+      PrintStream err,
+      JunitSecViolationReportingManager securityManager) {
+    this.securityManager = securityManager;
 
     Preconditions.checkNotNull(outputMode);
     Preconditions.checkNotNull(defaultConcurrency);
@@ -518,8 +534,8 @@ public class ConsoleRunnerImpl {
       throws InitializationError {
     Computer junitComputer = new ConcurrentComputer(concurrency, parallelThreads);
     Class<?>[] classes = specSet.extract(concurrency).classes();
-    CustomAnnotationBuilder builder =
-        new CustomAnnotationBuilder(numRetries, swappableErr.getOriginal());
+    RunnerBuilder builder =
+        getCustomBuilder(swappableErr.getOriginal());
     Runner suite = junitComputer.getSuite(builder, classes);
     return core.run(Request.runner(suite)).getFailureCount();
   }
@@ -543,14 +559,29 @@ public class ConsoleRunnerImpl {
     int failures = 0;
     Result result;
     for (Request request : requests) {
-      if (failFast) {
-        result = core.run(new FailFastRunner(request.getRunner()));
-      } else {
-        result = core.run(request);
-      }
+      result = core.run(runnerFor(request));
       failures += result.getFailureCount();
     }
     return failures;
+  }
+
+  private Runner runnerFor(Request request) {
+    Runner reqRunner = request.getRunner();
+
+    Runner withSecRunner = maybeWrapWithSecurity(reqRunner);
+    if (failFast) {
+      return new FailFastRunner(withSecRunner);
+    } else {
+      return withSecRunner;
+    }
+  }
+
+  private Runner maybeWrapWithSecurity(Runner reqRunner) {
+    if (securityManager == null) {
+      return reqRunner;
+    }else {
+      return new SecurityManagedRunner(reqRunner, securityManager);
+    }
   }
 
   private List<Request> legacyParseRequests(PrintStream err, Collection<Spec> specs) {
@@ -569,39 +600,76 @@ public class ConsoleRunnerImpl {
     List<Request> requests = Lists.newArrayList();
     if (!classes.isEmpty()) {
       if (this.perTestTimer || this.parallelThreads > 1) {
-        for (Class<?> clazz : classes) {
-          if (legacyShouldRunParallelMethods(clazz)) {
-            if (ScalaTestUtil.isScalaTestTest(clazz)) {
-              // legacy and scala doesn't work easily.  just adding the class
-              requests.add(new AnnotatedClassRequest(clazz, numRetries, err));
-            } else {
-              testMethods.addAll(TestMethod.fromClass(clazz));
-            }
-          } else {
-            requests.add(new AnnotatedClassRequest(clazz, numRetries, err));
-          }
-        }
+        addToRequestsOrTestMethods(err, classes, testMethods, requests);
       } else {
-        // The code below does what the original call
-        // requests.add(Request.classes(classes.toArray(new Class<?>[classes.size()])));
-        // does, except that it instantiates our own builder, needed to support retries.
-        try {
-          CustomAnnotationBuilder builder =
-              new CustomAnnotationBuilder(numRetries, err);
-          Runner suite = new Computer().getSuite(
-              builder, classes.toArray(new Class<?>[classes.size()]));
-          requests.add(Request.runner(suite));
-        } catch (InitializationError e) {
-          throw new RuntimeException(
-              "Internal error: Suite constructor, called as above, should always complete");
-        }
+        constructRequestsWithCustomBuilder(err, classes, requests);
       }
     }
     for (TestMethod testMethod : testMethods) {
-      requests.add(new AnnotatedClassRequest(testMethod.clazz, numRetries, err)
+      requests.add(newAnnotatedClassRequest(err, testMethod.clazz)
           .filterWith(Description.createTestDescription(testMethod.clazz, testMethod.name)));
     }
     return requests;
+  }
+
+  private void addToRequestsOrTestMethods(PrintStream err, Set<Class<?>> classes,
+                                          Set<TestMethod> testMethods, List<Request> requests) {
+    for (Class<?> clazz : classes) {
+      if (legacyShouldRunParallelMethods(clazz)) {
+        if (ScalaTestUtil.isScalaTestTest(clazz)) {
+          // legacy and scala doesn't work easily.  just adding the class
+          requests.add(newAnnotatedClassRequest(err, clazz));
+        } else {
+          testMethods.addAll(TestMethod.fromClass(clazz));
+        }
+      } else {
+        requests.add(newAnnotatedClassRequest(err, clazz));
+      }
+    }
+  }
+
+  private AnnotatedClassRequest newAnnotatedClassRequest(PrintStream err, Class<?> clazz) {
+    if (securityManager == null) {
+      return new AnnotatedClassRequest(clazz, numRetries, err);
+    } else {
+      return new AnnotatedClassRequest(clazz, numRetries, err) {
+
+        @Override
+        public Runner getRunner() {
+          Runner runner = super.getRunner();
+          return new SecurityManagedRunner(runner, securityManager);
+        }
+
+      };
+    }
+
+  }
+
+  private RunnerBuilder getCustomBuilder(PrintStream original) {
+    CustomAnnotationBuilder builder =
+        new CustomAnnotationBuilder(numRetries, original);
+    if (null != securityManager) {
+      return new SecurityBuilder(builder, securityManager);
+    } else {
+      return builder;
+    }
+  }
+
+  private void constructRequestsWithCustomBuilder(PrintStream err, Set<Class<?>> classes,
+                                                  List<Request> requests) {
+    // The code below does what the original call
+    // requests.add(Request.classes(classes.toArray(new Class<?>[classes.size()])));
+    // does, except that it instantiates our own builder, needed to support retries.
+    try {
+      RunnerBuilder builder =
+          getCustomBuilder(err);
+      Runner suite = new Computer().getSuite(
+          builder, classes.toArray(new Class<?>[classes.size()]));
+      requests.add(Request.runner(suite));
+    } catch (InitializationError e) {
+      throw new RuntimeException(
+          "Internal error: Suite constructor, called as above, should always complete");
+    }
   }
 
   private boolean legacyShouldRunParallelMethods(Class<?> clazz) {
@@ -793,22 +861,49 @@ public class ConsoleRunnerImpl {
       @Option(name="-use-experimental-runner",
           usage="Use the experimental runner that has support for parallel methods")
       private boolean useExperimentalRunner = false;
+
+      @Option(name = "-use-security-manager",
+          usage = "Use the security to enforce restrictions on tests.")
+      private boolean useSecurityManager = false;
+
+      @Option(name = "-security-thread-handling",
+          usage = "Choose how thread lifetimes are controlled by the security manager.")
+      private ThreadHandling threadHandling = ThreadHandling.disallowLeakingTestSuiteThreads;
+
+      @Option(name = "-security-exit-handling",
+          usage = "Choose how thread lifetimes are controlled by the security manager.")
+      private SystemExitHandling exitHandling = SystemExitHandling.disallow;
+
+      @Option(name = "-security-network-handling",
+          usage = "Choose how thread lifetimes are controlled by the security manager.")
+      private NetworkHandling networkHandling = NetworkHandling.allowAll;
+
     }
 
     Options options = new Options();
     CmdLineParser parser = new CmdLineParser(options);
     try {
       parser.parseArgument(args);
-    } catch (CmdLineException e) {
-      parser.printUsage(System.err);
-      exit(1);
-    } catch (InvalidCmdLineArgumentException e) {
+    } catch (CmdLineException | InvalidCmdLineArgumentException e) {
       parser.printUsage(System.err);
       exit(1);
     }
 
     options.defaultConcurrency = computeConcurrencyOption(options.defaultConcurrency,
         options.defaultParallel);
+
+    JunitSecViolationReportingManager securityManager;
+    if (options.useSecurityManager) {
+      JunitSecurityManagerConfig securityManagerConfig = new JunitSecurityManagerConfig(
+          options.exitHandling,
+          options.threadHandling,
+          options.networkHandling);
+      securityManager = new JunitSecViolationReportingManager(securityManagerConfig);
+      System.setSecurityManager(securityManager);
+    } else {
+      securityManager = null;
+    }
+
 
     ConsoleRunnerImpl runner =
         new ConsoleRunnerImpl(options.failFast,
@@ -824,7 +919,8 @@ public class ConsoleRunnerImpl {
             options.useExperimentalRunner,
             // NB: Buffering helps speedup output-heavy tests.
             new PrintStream(new BufferedOutputStream(System.out), true),
-            new PrintStream(new BufferedOutputStream(System.err), true));
+            new PrintStream(new BufferedOutputStream(System.err), true),
+            securityManager);
 
     List<String> tests = Lists.newArrayList();
     for (String test : options.tests) {
@@ -882,5 +978,62 @@ public class ConsoleRunnerImpl {
 
   public static void addTestListener(RunListener listener) {
     testListener = listener;
+  }
+
+  /**
+   * Needed to support retrying flaky tests as well as add support for running scala tests.
+   * Using method overriding, gives us access to code in JUnit4 that cannot be customized
+   * in a simpler way.
+   */
+  public static class SecurityBuilder extends AllDefaultPossibilitiesBuilder {
+
+    private final CustomAnnotationBuilder underlyingBuilder;
+    private final JunitSecViolationReportingManager securityManager;
+
+    SecurityBuilder(
+        CustomAnnotationBuilder underlyingBuilder,
+        JunitSecViolationReportingManager securityManager) {
+      super(true);
+      this.underlyingBuilder = underlyingBuilder;
+      this.securityManager = securityManager;
+    }
+
+    @Override
+    public JUnit4Builder junit4Builder() {
+      JUnit4Builder builder = new JUnit4Builder() {
+
+        @Override
+        public Runner runnerForClass(Class<?> testClass) throws Throwable {
+          return new SecurityManagedRunner(
+              underlyingBuilder.junit4Builder().runnerForClass(testClass),
+              securityManager);
+        }
+
+      };
+      return builder;
+    }
+
+    // override annotated builder to "fake" the scala test junit runner for scala tests
+    @Override
+    protected AnnotatedBuilder annotatedBuilder() {
+      return new ScalaTestAnnotatedBuilder(this);
+    }
+
+    private static class ScalaTestAnnotatedBuilder extends AnnotatedBuilder {
+      ScalaTestAnnotatedBuilder(RunnerBuilder suiteBuilder) {
+        super(suiteBuilder);
+      }
+
+      @Override
+      public Runner runnerForClass(Class<?> testClass) throws Exception {
+        Runner runner = super.runnerForClass(testClass);
+        if (runner == null) {
+          if (ScalaTestUtil.isScalaTestTest(testClass)) {
+            return ScalaTestUtil.getJUnitRunner(testClass);
+          }
+        }
+        return runner;
+      }
+    }
   }
 }

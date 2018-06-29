@@ -7,9 +7,12 @@ import com.google.common.base.Optional;
 import java.lang.reflect.Method;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.concurrent.Callable;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
+
+import org.pantsbuild.tools.junit.impl.security.JunitSecViolationReportingManager;
 
 /**
  * Takes strings passed to the command line representing packages or individual methods
@@ -75,17 +78,29 @@ class SpecParser {
    * @throws SpecException if the method passed in is not an executable test method
    */
   private Optional<Spec> getOrCreateSpec(String className, String specString) throws SpecException {
-    try {
-      Class<?> clazz = getClass().getClassLoader().loadClass(className);
-      if (Util.isTestClass(clazz)) {
-        if (!specs.containsKey(clazz)) {
-          Spec newSpec = new Spec(clazz);
-          specs.put(clazz, newSpec);
-        }
-        return Optional.of(specs.get(clazz));
+
+    Class<?> clazz = loadOrThrow(className, specString);
+    if (Util.isTestClass(clazz)) {
+      if (!specs.containsKey(clazz)) {
+        Spec newSpec = new Spec(clazz);
+        specs.put(clazz, newSpec);
       }
-      return Optional.absent();
-    } catch (ClassNotFoundException | NoClassDefFoundError e) {
+      return Optional.of(specs.get(clazz));
+    }
+    return Optional.absent();
+  }
+
+  private Class<?> loadOrThrow(final String className, String specString) {
+    try {
+      return JunitSecViolationReportingManager.maybeWithSecurityManagerContext(
+          className,
+          new Callable<Class<?>>() {
+            @Override
+            public Class<?> call() throws ClassNotFoundException {
+              return getClass().getClassLoader().loadClass(className);
+            }
+          });
+    } catch (NoClassDefFoundError | ClassNotFoundException e) {
       throw new SpecException(specString,
           String.format("Class %s not found in classpath.", className), e);
     } catch (LinkageError e) {
@@ -94,12 +109,13 @@ class SpecParser {
       throw new SpecException(specString,
           String.format("Error linking %s.", className), e);
       // See the comment below for justification.
-    } catch (RuntimeException e) {
+    } catch (Exception e) {
       // The class may fail with some variant of RTE in its static initializers, trap these
       // and dump the bad spec in question to help narrow down issue.
       throw new SpecException(specString,
-          String.format("Error initializing %s.",className), e);
+          String.format("Error initializing %s. %s cause: %s",className, e, e.getCause()), e);
     }
+
   }
 
   /**
