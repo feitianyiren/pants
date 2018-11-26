@@ -13,7 +13,7 @@ use futures::{future, Future, Stream};
 use futures_timer::Delay;
 use grpcio;
 use hashing::{Digest, Fingerprint};
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use protobuf::{self, Message, ProtobufEnum};
 use sha2::Sha256;
 use time;
@@ -145,7 +145,7 @@ impl super::CommandRunner for CommandRunner {
           .upload_protos(&command, &action)
           .and_then(move |summary| {
             history.current_attempt += summary;
-            debug!(
+            trace!(
               "Executing remotely request: {:?} (command: {:?})",
               execute_request,
               command
@@ -176,7 +176,7 @@ impl super::CommandRunner for CommandRunner {
                         current_attempt,
                       } = history;
 
-                      debug!(
+                      trace!(
                         "Server reported missing digests ({:?}); trying to upload: {:?}",
                         current_attempt,
                         missing_digests,
@@ -359,8 +359,7 @@ impl CommandRunner {
     operation_or_status: OperationOrStatus,
     attempts: &mut ExecutionHistory,
   ) -> BoxFuture<FallibleExecuteProcessResult, ExecutionError> {
-    // TODO: Log less verbosely
-    debug!("Got operation response: {:?}", operation_or_status);
+    trace!("Got operation response: {:?}", operation_or_status);
 
     let status = match operation_or_status {
       OperationOrStatus::Operation(mut operation) => {
@@ -383,8 +382,7 @@ impl CommandRunner {
             .merge_from_bytes(operation.get_response().get_value())
             .map_err(|e| ExecutionError::Fatal(format!("Invalid ExecuteResponse: {:?}", e)))
         );
-        // TODO: Log less verbosely
-        debug!("Got (nested) execute response: {:?}", execute_response);
+        trace!("Got (nested) execute response: {:?}", execute_response);
 
         if execute_response.get_result().has_execution_metadata() {
           let metadata = execute_response.get_result().get_execution_metadata();
